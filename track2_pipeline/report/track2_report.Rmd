@@ -1,0 +1,634 @@
+---
+title: "Mapping How Kalshi Traders Link Upcoming Fed Meetings"
+subtitle: "DAT 301 Project 1"
+author: "Bhavana Kannan"
+date: "November 1, 2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+---
+
+```{r setup, include = FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 
+                        9, fig.height = 5,
+                      fig.path = "figures/")   
+library(tidyverse)
+library(lubridate)
+theme_set(theme_minimal(base_size = 12))
+```
+
+# Background and problem definition
+
+
+**The topic.** About eight times a year the Federal Open Market Committee (FOMC), 
+part of the Federal Reserve that sets US short-term interest rates, meets 
+and decides whether to raise ("hike"), lower ("cut") or keep ("hold") its target 
+for the federal funds rate (Board of Governors of the Federal Reserve System, 
+n.d.). 
+Changes are measured in basis points (bp), where 1 bp is 0.01 percentage 
+point, and come in steps of 25 bp. These decisions move mortgage rates, 
+loan rates and stock prices, so traders bet on every upcoming meeting.
+
+**Why prediction markets.** Kalshi is a US-regulated prediction market. 
+For each FOMC meeting it lists one question ("What will the Fed do in December 2026?") 
+with five possible answers, called legs: cut more than 25 bp, cut 25 bp, hold, 
+hike 25 bp, and hike more than 25 bp.
+
+Each leg is a contract that pays $1 if that outcome happens, so a leg trading at 
+$0.70 means traders give that outcome about a 70% chance. 
+Combining the five legs gives one number per meeting per day: the expected 
+rate move in basis points.
+
+**Why a network.** Beliefs about different meetings should be connected. 
+If traders become more confident of a hike in December, they may also expect a 
+higher rate in January. 
+
+Looking at one meeting at a time hides those links. 
+
+This project treats each upcoming meeting as a node in a network. It measures how 
+closely the daily changes in expected moves line up between every pair of meetings, 
+and keeps only the strongest links with a minimum spanning tree (MST). 
+
+The MST approach was first used to map links between stock prices. 
+
+Here it is applied to beliefs about Fed meetings.
+
+**Why now.** On September 16, 2026, the FOMC raised its target range by 25 bp 
+
+That gives a natural before-and-after comparison: did the way traders link 
+future meetings change once the Fed started hiking?
+
+**Data.** All data comes from Kalshi's public API (series `KXFEDDECISION`)
+downloaded with `R/pull_kalshi.R`
+
+It covers 8 meetings (September 2026 to July 2027), 40 legs and 13,211 daily records. 
+
+Each record has the date, the best bid and ask price, the last trade price, 
+the daily volume and open interest. 
+
+The FOMC meeting calendar comes from the Federal Reserve website. 
+The main variables are the meeting (year-month), the date, the expected move 
+in basis points, and its daily change.
+
+**Research questions**
+
+1. Which upcoming FOMC meetings do Kalshi traders treat as linked? 
+Is the network a chain, where each meeting is tied to its neighbor, or does 
+one meeting act as a hub?
+
+2. Did that network change after the September 2026 hike?
+
+**What I hope to learn.** I am interested in prediction markets and forecasting, 
+This project lets me test whether a prediction market behaves like a coherent 
+forecast of the whole rate path or like a set of separate bets. 
+
+It also lets me learn graph methods (spanning trees, degree, permutation tests) 
+on data I care about.
+
+**Why it matters beyond this class.** Central banks, investors and journalists 
+read market prices as a forecast of where rates are going. If the prices for 
+different meetings hang together as one path, a single number such as 
+"the market expects two hikes in 2027" is meaningful. 
+
+If each meeting is priced on its own, that summary can mislead. 
+The network view tests which description fits Kalshi.
+
+**How this report is organized.** Section 2 turns the raw Kalshi prices into 
+one clean daily number per meeting, explaining each step. 
+
+Section 3 explores 
+the data with three questions: how often far meetings trade, how beliefs moved 
+around the hike, and whether nearby meetings move together. 
+
+Section 4 builds 
+and compares the two networks. 
+
+Section 5 states the conclusions, limitations 
+and ideas for future work.
+
+# Data wrangling and cleaning
+
+The raw data comes from `R/pull_kalshi.R`. This report reads only the saved 
+CSV files and makes no network calls.
+
+## Read the raw files
+
+```{r read-raw}
+candles  <- read_csv("../data/raw/kalshi_candles.csv")  
+markets  <- read_csv("../data/raw/kalshi_markets.csv")   
+meetings <- read_csv("../data/meetings.csv")            
+glimpse(candles)
+```
+
+Each row of `candles` is one leg on one day: 13,211 rows across 40 legs 
+(8 meetings x 5 legs). `bid` and `ask` are the best buy and sell offers for the 
+"yes" side, in dollars from 0 to 1; `last` is the last trade price (missing on 
+days with no trade); `volume` is contracts traded that day; `oi` is open 
+interest; `ts` is the end of the day in Unix seconds. `markets` holds one row 
+per leg with its outcome and, for settled meetings, the result. `meetings` lists each FOMC decision date.
+
+## Step 1: convert timestamps to US Eastern trading dates
+
+```{r step1-dates}
+candles <- candles |>
+  mutate(date = as_date(with_tz(as_datetime(ts - 1, tz = "UTC"), "America/New_York")))
+range(candles$date)
+```
+
+**What changed:** the numeric timestamp `ts` became a calendar `date`. 
+
+**Why:** Kalshi stamps each daily record at midnight US Eastern at the *end* 
+of the day, so the raw timestamp points to the next day. Subtracting one second 
+moves it back onto the trading day it describes. 
+
+US Eastern time is used because the Fed announces its decisions in Washington.
+
+## Step 2: pick one price per leg per day
+
+```{r step2-price}
+# price = midpoint of bid and ask; use the last trade only when the book is 
+# empty (no bid, ask at 0.99 or more)
+candles <- candles |>
+  mutate(empty_book = bid == 0 & ask >= 0.99,
+         p = if_else(empty_book, last, (bid + ask) / 2),
+         spread = ask - bid)
+count(candles, empty_book)
+
+# a quote wider than 20 cents carries little information (e.g. bid 0.00, ask 
+# 0.48 gives a midpoint of 0.24);
+# treat it as missing so step 4 carries the last good price forward
+quantile(candles$spread, c(0.50, 0.90, 0.95, 0.99))
+candles <- candles |>
+  filter(spread <= 0.20 | empty_book, !is.na(p))
+nrow(candles)
+```
+
+## Step 3: attach the meeting calendar
+
+```{r step3-meetings}
+# event ticker "KXFEDDECISION-26DEC" -> meeting "2026-12"
+code_to_meeting <- function(event) {
+  # input: event ticker; output: meeting as "YYYY-MM"
+  code <- str_remove(event, "^KXFEDDECISION-")
+  month_num <- match(str_sub(code, 3, 5), toupper(month.abb))
+  sprintf("20%s-%02d", str_sub(code, 1, 2), month_num)
+}
+
+move_bp <- c(CUT50P = -50, CUT25 = -25, HOLD = 0, HIKE25 = 25, HIKE50P = 50)   # policy move per leg, in bp
+
+legs <- candles |>
+  mutate(meeting = code_to_meeting(event),
+         move_bp = move_bp[outcome]) |>
+  left_join(select(meetings, meeting, decision_date), by = "meeting") |>
+  filter(date < decision_date)   # decision-day prices are settlement artifacts (all mids read 0.50)
+count(legs, meeting, decision_date)
+```
+
+
+## Step 4: fill short gaps in each leg
+
+```{r step4-fill}
+# Kalshi skips a leg's candle on some days; carry the last price forward, but for at most 5 days
+legs_daily <- legs |>
+  select(market, meeting, outcome, move_bp, date, p) |>
+  group_by(market, meeting, outcome, move_bp) |>
+  complete(date = seq(min(date), max(date), by = "day")) |>
+  mutate(obs_date = if_else(is.na(p), NA_Date_, date)) |>
+  fill(p, obs_date, .direction = "down") |>
+  filter(date - obs_date <= 5) |>
+  ungroup()
+c(rows_before = nrow(legs), rows_after = nrow(legs_daily))
+```
+
+
+## Step 5: expected move per meeting per day
+
+```{r step5-expected-move}
+# expected move = sum(probability x move) / sum(probability), in bp
+# days where the 5 leg prices sum outside 0.80 to 1.20 are dropped as inconsistent quotes
+panel <- legs_daily |>
+  group_by(meeting, date) |>
+  summarise(n_legs   = n(),
+            sum_raw  = sum(p),
+            e_move_bp = sum(p * move_bp) / sum(p),
+            .groups  = "drop")
+dropped <- panel |> filter(sum_raw < 0.80 | sum_raw > 1.20)
+panel   <- panel |> filter(between(sum_raw, 0.80, 1.20))
+c(days_kept = nrow(panel), days_dropped = nrow(dropped))
+summary(panel$sum_raw)
+```
+
+
+## Step 6: daily changes and the two windows
+
+```{r step6-changes}
+nodes <- c("2026-10", "2026-12", "2027-01", "2027-03", "2027-04", "2027-06", "2027-07")
+hike_date <- as_date("2026-09-16")
+
+# wide table: one row per date, one column per meeting, values = expected move in bp
+wide <- panel |>
+  filter(meeting %in% nodes, date >= as_date("2025-10-06"), date <= as_date("2026-10-27")) |>
+  select(date, meeting, e_move_bp) |>
+  pivot_wider(names_from = meeting, values_from = e_move_bp) |>
+  complete(date = seq(min(date), max(date), by = "day")) |>
+  arrange(date)
+
+# daily change = today minus yesterday, in bp; the hike day itself is left out of both windows
+changes <- wide |>
+  mutate(across(all_of(nodes), ~ .x - lag(.x))) |>
+  slice(-1) |>
+  mutate(window = case_when(date <  hike_date ~ "before",
+                            date >  hike_date ~ "after",
+                            TRUE              ~ NA_character_)) |>
+  filter(!is.na(window))
+count(changes, window)
+```
+
+
+## Check: frozen prices
+
+```{r check-frozen}
+# share of days with zero change, per meeting and window; a mostly frozen meeting carries little information
+frozen <- changes |>
+  pivot_longer(all_of(nodes), names_to = "meeting", values_to = "change") |>
+  filter(!is.na(change)) |>
+  group_by(window, meeting) |>
+  summarise(days = n(), zero_change_share = mean(change == 0), .groups = "drop")
+frozen |> pivot_wider(names_from = window, values_from = c(days, zero_change_share)) |> knitr::kable(digits = 2)
+```
+
+Before the hike, 30% to 59% of days show no change at all, and the share rises 
+for meetings further away. After the hike, at most 12% of days are unchanged. 
+
+No meeting is completely frozen, so all 7 stay in the network, but the many 
+
+zero-change days before the hike will pull those correlations toward zero. 
+
+This is an important caveat for comparing the two windows.
+
+# Exploratory data analysis
+
+## Question 1: does trading dry up for far meetings?
+
+```{r eda1-trading, fig.height = 4.5}
+# share of days on which at least one leg of the meeting traded, within 2025-10-06 to 2026-10-27
+trade_share <- legs |>
+  filter(meeting %in% nodes, date >= as_date("2025-10-06"), date <= as_date("2026-10-27")) |>
+  group_by(meeting, date) |>
+  summarise(traded = sum(volume, na.rm = TRUE) > 0, .groups = "drop") |>
+  group_by(meeting) |>
+  summarise(share_traded = mean(traded))
+
+ggplot(trade_share, aes(x = meeting, y = share_traded)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = scales::percent(share_traded, accuracy = 1)), vjust = -0.4) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(title = "Share of days with at least one trade, by FOMC meeting",
+       subtitle = "Kalshi KXFEDDECISION, 2025-10-06 to 2026-10-27",
+       x = "FOMC meeting (year-month)", y = "Days with a trade (%)")
+```
+
+**Question.** Do traders actually trade the far-off meetings, or only the near ones?
+
+**Analysis.** For each meeting, the share of days in the study period on which 
+at least one of its five legs traded.
+
+**Evidence.** The two nearest meetings (October and December 2026) traded on 
+
+about 60% of days. Activity falls with distance: 43% for January 2027, 32% to 
+36% for March and April, and only 20% for June 2027.
+
+
+## Question 2: did the hike move beliefs about every later meeting?
+
+```{r eda2-hike-odds}
+# probability of a hike at the September 2026 meeting in the week before the decision
+legs_daily |>
+  filter(meeting == "2026-09", date >= hike_date - 7) |>
+  group_by(date) |>
+  summarise(p_hike = sum(p[move_bp > 0]) / sum(p)) |>
+  knitr::kable(digits = 2)
+```
+
+```{r eda2-line, fig.height = 6}
+# one panel per meeting so the 7 series do not overlap
+panel |>
+  filter(meeting %in% nodes, date >= as_date("2025-10-06"), date <= as_date("2026-10-27")) |>
+  ggplot(aes(x = date, y = e_move_bp)) +
+  geom_hline(yintercept = 0, colour = "grey70") +
+  geom_line(colour = "steelblue") +
+  geom_vline(xintercept = hike_date, linetype = "dashed", colour = "firebrick") +
+  facet_wrap(~ meeting, ncol = 4) +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b %y") +
+  labs(title = "Expected policy move at each upcoming FOMC meeting",
+       subtitle = "Probability-weighted Kalshi prices; red dashed line is the 2026-09-16 hike",
+       x = "Date", y = "Expected move (basis points)")
+```
+
+**Question.** Did the September hike come as a surprise, and did it move beliefs 
+about every later meeting?
+
+**Analysis.** The table gives Kalshi's probability of a hike at the September 
+meeting in the final week. The chart shows the expected move for each of the 7 
+later meetings over the full period, with the hike date marked.
+
+**Interpretation.** Because the hike was priced in, it did not shock near-term 
+beliefs. Instead, in the weeks after it, traders pushed expected hikes further 
+out into 2027, as if they now saw the hike as the start of a cycle rather than 
+a one-off. The series are also much flatter before April 2026, matching the stale quoting found earlier.
+
+## Question 3: are neighboring meetings the most correlated?
+
+```{r eda3-scatter}
+# correlation of daily changes for each of the 21 meeting pairs, in each window
+pair_cor <- changes |>
+  group_by(window) |>
+  group_modify(~ {
+    m <- cor(select(.x, all_of(nodes)), use = "pairwise.complete.obs")
+    as_tibble(as.table(m), .name_repair = "minimal") |>
+      setNames(c("a", "b", "rho"))
+  }) |>
+  ungroup() |>
+  filter(a < b) |>
+  mutate(months_apart = as.numeric(ym(b) - ym(a)) / 30.44)   # gap between the two meetings, in months
+
+ggplot(pair_cor, aes(x = months_apart, y = rho, colour = window)) +
+  geom_point(size = 2.5) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.7) +
+  scale_colour_manual(values = c(before = "grey40", after = "firebrick")) +
+  labs(title = "Correlation of daily changes vs distance between meetings",
+       subtitle = "Each point is one of 21 meeting pairs; lines are least-squares fits",
+       x = "Months between the two meetings", y = "Correlation of daily changes (rho)",
+       colour = "Window")
+```
+
+**Question.** Are meetings that are close in time the ones that move together 
+most, and did that change after the hike?
+
+**Analysis.** For each of the 21 pairs of meetings, the correlation of their 
+daily changes in each window, plotted against the number of months between them, 
+with a straight-line fit per window.
+
+# Graph analysis
+
+## Correlation matrices
+
+```{r graph-cor, fig.height = 4.8}
+# correlation of daily changes between every pair of meetings, one 7 x 7 matrix per window
+cor_matrix <- function(df) {
+  # input: rows of `changes` for one window; output: 7 x 7 correlation matrix (rho)
+  cor(select(df, all_of(nodes)), use = "pairwise.complete.obs")
+}
+C_before <- cor_matrix(filter(changes, window == "before"))
+C_after  <- cor_matrix(filter(changes, window == "after"))
+
+heat <- bind_rows(
+  as_tibble(as.table(C_before), .name_repair = "minimal") |> setNames(c("a", "b", "rho")) |> mutate(window = "Before hike"),
+  as_tibble(as.table(C_after),  .name_repair = "minimal") |> setNames(c("a", "b", "rho")) |> mutate(window = "After hike")
+) |>
+  mutate(window = factor(window, levels = c("Before hike", "After hike")))
+
+ggplot(heat, aes(x = a, y = b, fill = rho)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%.2f", rho)), size = 3) +
+  scale_fill_gradient2(low = "steelblue", mid = "white", high = "firebrick", limits = c(-1, 1)) +
+  facet_wrap(~ window) +
+  coord_equal() +
+  labs(title = "Correlation of daily changes in expected move between FOMC meetings",
+       subtitle = "Before: 2025-10-06 to 2026-09-15 (344 days). After: 2026-09-17 to 2026-10-27 (41 days)",
+       x = "FOMC meeting", y = "FOMC meeting", fill = "rho") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+## Distances and minimum spanning trees
+
+```{r graph-mst}
+library(igraph)
+
+# distance d = sqrt(2 * (1 - rho)): rho = 1 gives 0, rho = 0 gives 1.41, rho = -1 gives 2
+to_distance <- function(C) sqrt(2 * (1 - C))
+
+build_mst <- function(C) {
+  # input: correlation matrix; output: igraph minimum spanning tree with edge attributes weight (distance) and rho
+  g <- graph_from_adjacency_matrix(to_distance(C), mode = "undirected", weighted = TRUE, diag = FALSE)
+  t <- mst(g, weights = E(g)$weight)   # Kruskal-type algorithm: shortest edges first, skip any that close a loop
+  ends <- ends(t, E(t))
+  E(t)$rho <- C[ends]
+  t
+}
+
+edge_keys <- function(t) {
+  # input: tree; output: one text key per edge, e.g. "2026-10|2026-12", with the earlier meeting first
+  e <- ends(t, E(t))
+  paste(pmin(e[, 1], e[, 2]), pmax(e[, 1], e[, 2]), sep = "|")
+}
+
+tree_before <- build_mst(C_before)
+tree_after  <- build_mst(C_after)
+
+edges_table <- function(t, label) {
+  # input: tree and window label; output: one row per edge with rho and distance
+  tibble(window = label, edge = edge_keys(t), rho = E(t)$rho, distance = E(t)$weight)
+}
+tree_edges <- bind_rows(edges_table(tree_before, "before"), edges_table(tree_after, "after"))
+knitr::kable(tree_edges, digits = 2)
+```
+
+**Method.** Each correlation is turned into a distance with d = sqrt(2(1 - rho)), 
+so strongly linked meetings are close (rho = 1 gives 0) and unrelated ones are 
+far (rho = 0 gives 1.41). 
+
+With 7 meetings there are 21 possible edges. The minimum spanning tree keeps the 
+6 edges with the smallest total distance that still connect all 7 meetings 
+without a loop: it sorts edges from shortest to longest and adds each one unless 
+it would close a loop. 
+
+The table lists the 6 edges kept in each window.
+
+
+## Comparing the two trees
+
+```{r graph-compare}
+shared <- intersect(edge_keys(tree_before), edge_keys(tree_after))
+shared
+
+# permutation test: shuffle the meeting labels on the after tree 5000 times
+# and count how often a random relabelling shares at least as many edges with the before tree
+set.seed(301)
+n_perm <- 5000
+before_keys <- edge_keys(tree_before)
+after_ends  <- ends(tree_after, E(tree_after))
+perm_shared <- replicate(n_perm, {
+  relabel <- setNames(sample(nodes), nodes)
+  a <- relabel[after_ends[, 1]]
+  b <- relabel[after_ends[, 2]]
+  sum(paste(pmin(a, b), pmax(a, b), sep = "|") %in% before_keys)
+})
+k <- sum(perm_shared >= length(shared))
+p_value <- (k + 1) / (n_perm + 1)
+c(shared_edges = length(shared), mean_by_chance = mean(perm_shared), p_value = p_value)
+```
+
+```{r graph-perm-hist, fig.height = 4}
+ggplot(tibble(shared = perm_shared), aes(x = shared)) +
+  geom_histogram(binwidth = 1, fill = "grey70", colour = "white") +
+  geom_vline(xintercept = length(shared), colour = "firebrick", linewidth = 1) +
+  scale_x_continuous(breaks = 0:6) +
+  labs(title = "Shared edges expected by chance vs observed",
+       subtitle = sprintf("5000 random relabellings of the after tree; red line = observed (%d shared edges), p = %.3f",
+                          length(shared), p_value),
+       x = "Edges shared with the before tree (of 6)", y = "Number of relabellings")
+```
+
+
+## Degree and hubs
+
+```{r graph-degree}
+degree_table <- tibble(meeting   = nodes,
+                       before = as.numeric(degree(tree_before)[nodes]),
+                       after  = as.numeric(degree(tree_after)[nodes]))
+knitr::kable(degree_table, col.names = c("Meeting", "Degree before", "Degree after"))
+```
+
+A meeting's degree is the number of tree edges touching it. In the before tree every meeting has degree 1 or 2, which is the signature of a chain: no meeting acts as a hub. After the hike January 2027 has degree 3, the closest thing to a hub. With only 7 nodes, a degree of 3 is a mild hub, so this is a hint rather than a strong finding.
+
+## Side-by-side trees
+
+```{r graph-trees, fig.width = 10, fig.height = 5.5}
+# circle layout in meeting order, same positions in both panels; shared edges in red, edge labels are rho
+draw_tree <- function(t, title) {
+  # input: tree and panel title; output: base R network plot
+  lay <- layout_in_circle(t, order = match(nodes, V(t)$name))
+  cols <- ifelse(edge_keys(t) %in% shared, "firebrick", "grey40")
+  plot(t, layout = lay,
+       vertex.color = "steelblue", vertex.label.color = "white", vertex.size = 34,
+       vertex.label.cex = 0.75, vertex.frame.color = NA,
+       edge.color = cols, edge.width = 3,
+       edge.label = sprintf("%.2f", E(t)$rho), edge.label.cex = 0.8, edge.label.color = "black",
+       main = title)
+}
+par(mfrow = c(1, 2), mar = c(1, 1, 3, 1))
+draw_tree(tree_before, "Before the hike (344 days)")
+draw_tree(tree_after,  "After the hike (41 days)")
+mtext("Minimum spanning trees of FOMC meetings; red = edge in both trees, labels = correlation", side = 1, line = -1, outer = TRUE)
+```
+
+**What to notice.** Meetings sit around the circle in calendar order, counterclockwise from October 2026 on the right, in the same position in both panels, so any change in the lines is a change in structure. Before the hike, the edges mostly connect neighbors around the circle (a chain). After the hike, the edges cut across the circle and run through January 2027. Only the two red edges appear in both. **Why it matters:** this is the answer to both research questions in one picture.
+
+## Check: is the difference only about window length?
+
+```{r graph-sensitivity}
+# the after window has 41 days; build a tree from the last 41 days before the hike for a like-for-like comparison
+late_before <- changes |> filter(window == "before") |> slice_tail(n = 41)
+tree_late   <- build_mst(cor_matrix(late_before))
+tibble(
+  comparison   = c("full before vs after", "last 41 days before vs after", "last 41 days before vs full before"),
+  shared_edges = c(length(shared),
+                   length(intersect(edge_keys(tree_late), edge_keys(tree_after))),
+                   length(intersect(edge_keys(tree_late), edge_keys(tree_before))))
+) |> knitr::kable()
+```
+
+**Why this check.** A tree built from only 41 days could differ from the before 
+tree simply because short samples are noisy. So a third tree was built from the 
+last 41 days before the hike (early August to September 15, 2026). That tree 
+shares 5 of 6 edges with the full before tree. A short window can therefore 
+reproduce the before structure, which makes it more likely that the after tree's different shape reflects a real change. 
+
+## Interactive view
+
+```{r graph-interactive}
+# hover over a point to see the meeting pair; same data as the EDA Question 3 scatter
+p <- ggplot(pair_cor, aes(x = months_apart, y = rho, colour = window,
+                          text = paste0(a, " & ", b, "<br>rho = ", round(rho, 2)))) +
+  geom_point(size = 2.5) +
+  scale_colour_manual(values = c(before = "grey40", after = "firebrick")) +
+  labs(title = "Correlation vs months between meetings (interactive)",
+       x = "Months between the two meetings", y = "Correlation of daily changes (rho)", colour = "Window")
+plotly::ggplotly(p, tooltip = "text")
+```
+
+**What to notice.** This is the EDA Question 3 scatter in interactive form: 
+hovering over a point shows which two meetings it compares and their correlation. 
+
+It makes two patterns easy to check by hand: the highest red points are pairs of 
+near meetings (October 2026 to March 2027), and the lowest red points all involve July 2027. 
+
+# Conclusions
+
+
+**Summary of major findings**
+
+- Kalshi prices for different Fed meetings are linked, but the links depend 
+on the policy situation. In a quiet period they are weak and local; 
+once the Fed started hiking they became stronger and more connected.
+
+- Prediction-market prices for far meetings need care: many of them are stale 
+quotes rather than fresh beliefs, and cleaning choices (midpoints, the spread 
+rule, gap filling) shape what the network shows.
+
+**Answer to research question 1: which meetings are linked?**
+
+- Before the hike, Kalshi traders linked meetings like a line of dominoes: each 
+meeting mostly moved with the one next to it in time, and no single meeting 
+acted as a hub. This is what you would expect if traders update their view of 
+the rate path one step at a time.
+- The links were weak. Most days, far meetings did not trade and their 
+prices did not move, so the before network says as much about thin trading as about beliefs.
+
+**Answer to research question 2: did the network change after the hike?**
+
+- Yes, in strength and in shape. After the hike, near meetings started moving 
+together about twice as strongly, and the tree reorganized around January 2027.
+
+**Patterns and possible explanations**
+
+- The hike itself was not a surprise (87% priced the day before), so the change 
+in the network is not a shock reaction. 
+- After the hike, traders pushed expected hikes into 2027 (March 2027 rose 
+from about 0 to 13 bp), consistent with seeing the start of a hiking cycle.
+- July 2027 moved against the other meetings after the hike. 
+- Trading activity rose sharply after the hike (unchanged days fell from about 
+half to about one in ten), which by itself makes correlations easier to detect.
+
+**What this means**
+
+- A prediction market can behave like one forecast of a rate path rather 
+than a set of separate bets, but only when there is something to forecast. 
+Before the hike, with policy on hold, prices for most meetings barely changed 
+from day to day; after it, news that moved one meeting also moved its neighbors.
+
+
+**Limitations**
+
+- The after window has only 41 days, so each correlation is noisy, and the 
+permutation test has little power to detect agreement between the trees.
+- Far 2027 meetings trade rarely; stale quotes push correlations toward zero, 
+especially before the hike.
+- Only one market (Kalshi) is used, so the results describe Kalshi traders, 
+not all investors.
+- FOMC dates from 2027 on are tentative, and the "more than 25 bp" legs are 
+coded as exactly 50 bp.
+- With 7 nodes, a tree has only 6 edges, so measures like degree can change 
+with a single edge.
+
+**Future work**
+
+- Compare Kalshi's network with one built from CME 30-Day Fed Funds futures, 
+which price the same meetings with far more trading.
+- Use rolling windows (for example 60 days) to watch the tree change continuously 
+instead of in two blocks.
+- Add other scheduled events with prediction markets, such as inflation (CPI) 
+and jobs reports, to see whether Fed meetings link to them.
+
+# References
+
+- Board of Governors of the Federal Reserve System. (n.d.). *Meeting calendars, statements, and minutes.* Retrieved November 1, 2026, from https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
+- Kalshi. (n.d.). *Kalshi API documentation.* Retrieved October 29, 2026, from https://docs.kalshi.com
+- Kruskal, J. B. (1956). On the shortest spanning subtree of a graph and the traveling salesman problem. *Proceedings of the American Mathematical Society*, 7(1), 48-50.
+- Mantegna, R. N. (1999). Hierarchical structure in financial markets. *The European Physical Journal B*, 11(1), 193-197.

@@ -1,0 +1,26 @@
+# raw Kalshi and CME-derived data: Kalshi's terms do not allow republishing; run R/pull_kalshi.R to download
+track2_pipeline/data/raw/
+track2_pipeline/data/panels/
+
+# archives and the course upload copy (contains raw data and the recorded video)
+*.zip
+DAT301_Project1_Bhavana_Kannan/
+
+# private course material and working notes (kept locally, not published)
+DAT301_Project1_Individual.html
+CLAUDE.md
+PROMPT.md
+PLAN_NOV1.md
+PROGRESS.md
+PRESENTATION.md
+SCRIPT.md
+
+# R and Python by-products
+__pycache__/
+*.pyc
+.Rhistory
+.RData
+.Rproj.user/
+Rplots.pdf
+*_cache/
+*_files/
