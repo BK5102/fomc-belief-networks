@@ -13,6 +13,7 @@ Learn the blocks in order. Each block lists what to learn, then defines every te
 | D | Graph theory | 50 min | Fri morning |
 | E | R functions used in the code | while reading code | Thu to Sat |
 | F | Report vocabulary and limitations | 15 min | Sat |
+| G | Follow-up checks (extensions report) | 20 min | optional |
 
 Total: about 2 h 45 min plus reading the code.
 
@@ -111,3 +112,15 @@ Learn: graph, weighted graph, correlation-to-distance, tree, spanning tree, MST,
 - **Futures are not options.** (Nice) A future tracks one number; an option is a right to buy or sell at a fixed price and reveals a full probability range. No accessible options market exists on the fed funds rate (Diercks, Katz and Wright, FEDS 2026-010).
 - **Limitations to name.** (Must) Short after window; stale 2027 quotes; one market only; tentative 2027 dates; chain-shaped trees make degree uninformative; expected move uses -50 and +50 for the "more than 25 bp" legs.
 - **Future work.** (Must) Compare with futures or Polymarket; rolling windows to watch the tree change over time; other events (CPI, jobs reports).
+
+## Block G. Follow-up checks (`report/extensions.Rmd`)
+
+- **Exact permutation test.** With 7 meetings there are only 7! = 5,040 ways to relabel a tree, so every relabelling can be checked instead of drawing 5,000 at random. The p-value is the share of relabellings that match or beat the observed count.
+- **Same-regime block null.** Build a tree from every 41-day stretch of the before window and compare it with the tree from the rest of the window. This shows how much two samples agree when nothing has changed, which is the right yardstick for "did the network change?"
+- **Moving-block bootstrap.** Resample a window by stitching together random 5-day blocks of days (blocks keep day-to-day dependence), rebuild the tree each time, and count how often each edge appears. An edge in 80%+ of resamples is stable.
+- **Rolling window.** Recompute the tree on the last 60 days, moving forward one day at a time, to see how the network drifts.
+- **Mantel correlation.** Correlation between the entries of two distance matrices: how similar two whole networks are, not just their trees.
+- **Jennrich test.** A chi-square test that two correlation matrices are equal. It assumes independent, normally distributed days; on this data it rejects even for two parts of the same period, so it is miscalibrated here.
+- **Calibration.** A test is calibrated when it rejects about 5% of the time at the 0.05 level when nothing has changed. Checking a test on data where the answer is known ("no change") is how you find out.
+- **Non-stationarity.** The data's behavior drifts over time (here: Kalshi quotes go from mostly stale to actively traded through 2026), so a long window averages over different regimes.
+- **Regression test.** A test that the refactored code gives exactly the same numbers as the original report.
