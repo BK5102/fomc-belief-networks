@@ -1,0 +1,28 @@
+Type: Project
+Package: fomcbeliefnetworks
+Title: Minimum Spanning Tree Networks of Kalshi FOMC Meeting Prices
+Version: 1.1.0
+Authors@R: person("Bhavana", "Kannan", role = c("aut", "cre"))
+Description: Downloads Kalshi Fed-decision prices, builds a daily expected
+    policy move per FOMC meeting, and compares minimum spanning trees of
+    meeting correlations before and after the September 2026 hike.
+License: MIT
+Depends: R (>= 4.4)
+Imports:
+    dplyr,
+    ggplot2,
+    httr2,
+    igraph,
+    jsonlite,
+    knitr,
+    lubridate,
+    plotly,
+    readr,
+    rmarkdown,
+    scales,
+    stringr,
+    tibble,
+    tidyr,
+    tidyverse
+Suggests:
+    testthat (>= 3.0.0)

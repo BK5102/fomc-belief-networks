@@ -84,36 +84,52 @@ market_candles <- function(market, start_ts, end_ts, archived) {
   )
 }
 
-now_ts <- as.numeric(Sys.time())
-market_rows <- list()
-candle_rows <- list()
-
-for (event in EVENTS) {
-  em <- event_markets(event)
-  for (mk in em$markets) {
-    leg <- sub(".*-", "", mk$ticker)   # text after the last "-", e.g. "H25"
-    info <- LEGS[LEGS$leg == leg, ]
-    if (nrow(info) == 0) { message("skip unknown leg ", mk$ticker); next }
-    open_ts <- as.numeric(as.POSIXct(mk$open_time, format = "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"))
-    market_rows[[mk$ticker]] <- data.frame(
-      event = event, market = mk$ticker, leg = leg, outcome = info$outcome, move_bp = info$move_bp,
-      status = if (is.null(mk$status)) NA_character_ else mk$status,
-      result = if (is.null(mk$result)) NA_character_ else mk$result,
-      open_time = mk$open_time, close_time = mk$close_time
-    )
-    cd <- market_candles(mk$ticker, floor(open_ts), floor(now_ts), em$archived)
-    if (!is.null(cd)) {
-      cd$event <- event
-      cd$outcome <- info$outcome
-      candle_rows[[mk$ticker]] <- cd
+# pull_kalshi: download all legs and daily candles for a set of events and write two CSVs.
+# Inputs: events (event tickers), end_date (last US Eastern trading date to keep, Date),
+#   out_dir (folder for the CSVs).
+# Output: invisible list(markets, candles); writes out_dir/kalshi_markets.csv and out_dir/kalshi_candles.csv.
+# The default end_date 2026-10-29 matches the original pull (run during 2026-10-29), so a re-run gives the same rows.
+pull_kalshi <- function(events = EVENTS, end_date = as.Date("2026-10-29"), out_dir = "data/raw") {
+  # last candle kept ends at midnight US Eastern after end_date
+  end_ts <- as.numeric(as.POSIXct(paste(end_date + 1, "00:00:00"), tz = "America/New_York"))
+  market_rows <- list()
+  candle_rows <- list()
+  for (event in events) {
+    em <- event_markets(event)
+    for (mk in em$markets) {
+      leg <- sub(".*-", "", mk$ticker)   # text after the last "-", e.g. "H25"
+      info <- LEGS[LEGS$leg == leg, ]
+      if (nrow(info) == 0) { message("skip unknown leg ", mk$ticker); next }
+      open_ts <- as.numeric(as.POSIXct(mk$open_time, format = "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"))
+      market_rows[[mk$ticker]] <- data.frame(
+        event = event, market = mk$ticker, leg = leg, outcome = info$outcome, move_bp = info$move_bp,
+        status = if (is.null(mk$status)) NA_character_ else mk$status,
+        result = if (is.null(mk$result)) NA_character_ else mk$result,
+        open_time = mk$open_time, close_time = mk$close_time
+      )
+      cd <- market_candles(mk$ticker, floor(open_ts), floor(end_ts), em$archived)
+      if (!is.null(cd)) cd <- cd[cd$ts <= end_ts, ]   # the API pads end_ts by one day; trim back
+      if (!is.null(cd) && nrow(cd) > 0) {
+        cd$event <- event
+        cd$outcome <- info$outcome
+        candle_rows[[mk$ticker]] <- cd
+      }
+      message(sprintf("%-28s archived=%-5s days=%d", mk$ticker, em$archived, if (is.null(cd)) 0L else nrow(cd)))
     }
-    message(sprintf("%-28s archived=%-5s days=%d", mk$ticker, em$archived, if (is.null(cd)) 0L else nrow(cd)))
   }
+  markets <- do.call(rbind, market_rows)
+  candles <- do.call(rbind, candle_rows)
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  write.csv(markets, file.path(out_dir, "kalshi_markets.csv"), row.names = FALSE)
+  write.csv(candles, file.path(out_dir, "kalshi_candles.csv"), row.names = FALSE)
+  message("wrote ", nrow(markets), " markets and ", nrow(candles), " candles to ", out_dir)
+  invisible(list(markets = markets, candles = candles))
 }
 
-markets <- do.call(rbind, market_rows)
-candles <- do.call(rbind, candle_rows)
-dir.create("data/raw", showWarnings = FALSE, recursive = TRUE)
-write.csv(markets, "data/raw/kalshi_markets.csv", row.names = FALSE)
-write.csv(candles, "data/raw/kalshi_candles.csv", row.names = FALSE)
-message("wrote ", nrow(markets), " markets and ", nrow(candles), " candles to data/raw/")
+# run on source() or Rscript unless options(pull_kalshi.run = FALSE) is set first
+# Rscript R/pull_kalshi.R [end_date YYYY-MM-DD] [out_dir]
+if (isTRUE(getOption("pull_kalshi.run", TRUE))) {
+  args <- commandArgs(trailingOnly = TRUE)
+  pull_kalshi(end_date = if (length(args) >= 1) as.Date(args[1]) else as.Date("2026-10-29"),
+              out_dir  = if (length(args) >= 2) args[2] else "data/raw")
+}

@@ -1,0 +1,287 @@
+---
+title: "FOMC Belief Networks: Extensions and Robustness Checks"
+subtitle: "Follow-up to the DAT 301 Project 1 report"
+author: "Bhavana Kannan"
+date: "November 2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 9, fig.height = 5,
+                      fig.path = "figures/ext-")
+library(ggplot2)
+theme_set(theme_minimal(base_size = 12))
+source("../R/wrangle.R")
+source("../R/graph.R")
+```
+
+# Purpose
+
+The submitted report (`track2_report.Rmd`, tag `v1.0-submitted`) found that the minimum spanning tree (MST) of Kalshi FOMC meetings looked different after the 2026-09-16 hike: 2 of 6 edges shared, correlations about twice as strong, and a 41-day check suggesting the change was not a short-window artifact. This document re-runs that analysis with the refactored functions in `R/wrangle.R` and `R/graph.R` and adds checks the report did not have time for:
+
+1. a fix for a daylight-saving-time bug in the trading-date step;
+2. an exact permutation test in place of the Monte Carlo one;
+3. a null distribution for "two 41-day samples from the same regime", built from every 41-day block of the before window;
+4. tests of whether correlations got stronger, calibrated the same way;
+5. bootstrap edge stability;
+6. rolling-window trees;
+7. robustness to the correlation measure, stale-quote handling, leg coding and cleaning thresholds.
+
+The short version: the refactor reproduces the report exactly, the DST fix does not change the trees, and **the after-hike network is not distinguishable from what a 41-day window of the before period produces.** The contrast in the report comes mostly from a steady rise in Kalshi liquidity through 2026, not from the hike.
+
+```{r data}
+raw <- read_raw("../data/raw", "../data/meetings.csv")
+main   <- build_panel(raw, date_rule = "est")
+report <- build_panel(raw, date_rule = "eastern")
+split_windows <- function(b) list(before = dplyr::filter(b$changes, window == "before"),
+                                  after  = dplyr::filter(b$changes, window == "after"))
+w  <- split_windows(main)
+Cb <- cor_matrix(w$before, NODES); Ca <- cor_matrix(w$after, NODES)
+tb <- build_mst(Cb);               ta <- build_mst(Ca)
+```
+
+# Daylight-saving-time fix
+
+Kalshi's daily candles end at midnight US Eastern *Standard* Time (05:00 UTC) in winter and at 04:00 UTC in summer. The report converted `ts - 1 s` to an America/New_York date. In the original pull, the candle for Sunday 2026-03-08 was stamped 05:00 UTC on 2026-03-09, which is already 01:00 daylight time, so it landed on 2026-03-09. Five meetings then had two rows on 03-09 and none on 03-08; their leg prices summed to about 2 and the day was dropped by the 0.80 to 1.20 filter. `add_trading_date(rule = "est")` reads the timestamp on a fixed UTC-5 clock instead, which puts both 04:00 and 05:00 UTC candle ends on the previous day.
+
+```{r dst-fix}
+wr <- split_windows(report)
+Cb_r <- cor_matrix(wr$before, NODES); Ca_r <- cor_matrix(wr$after, NODES)
+dup_rows <- raw$candles |> add_trading_date("eastern") |> dplyr::count(market, date) |> dplyr::filter(n > 1)
+tibble(
+  quantity = c("leg-days stamped twice", "meeting-days kept", "meeting-days dropped (sum outside 0.80-1.20)",
+               "largest change in a before-window correlation", "largest change in an after-window correlation",
+               "before-tree edges unchanged (of 6)", "after-tree edges unchanged (of 6)"),
+  report_rule = c(nrow(dup_rows), nrow(report$panel), nrow(report$dropped), "", "", "", ""),
+  fixed_rule  = c(nrow(raw$candles |> add_trading_date("est") |> dplyr::count(market, date) |> dplyr::filter(n > 1)),
+                  nrow(main$panel), nrow(main$dropped),
+                  sprintf("%.3f", max(abs(Cb - Cb_r))), sprintf("%.3f", max(abs(Ca - Ca_r))),
+                  n_shared(tb, build_mst(Cb_r)), n_shared(ta, build_mst(Ca_r)))
+) |> knitr::kable(col.names = c("", "Report (America/New_York)", "Fixed (UTC-5)"), align = "lrr")
+```
+
+The fix recovers `r nrow(main$panel) - nrow(report$panel)` meeting-days and moves one before-window correlation by up to `r round(max(abs(Cb - Cb_r)), 3)`, but both trees are identical. A fresh download on 2026-11-14 also showed that Kalshi now stamps that candle at 04:00 UTC, so a re-pull and the original pull disagree on these timestamps; the UTC-5 rule gives the same dates for both.
+
+# Exact permutation test
+
+With 7 meetings there are only 7! = 5,040 ways to relabel the after tree, so the p-value can be computed exactly instead of estimated from 5,000 random draws.
+
+```{r exact-perm}
+mc <- perm_shared_mc(tb, ta, NODES, n_perm = 5000, seed = 301)
+ex <- perm_shared_exact(tb, ta, NODES)
+tibble(test = c("Monte Carlo, 5000 draws (report)", "Exact, all 5040 relabellings"),
+       shared_edges = c(mc$observed, ex$observed),
+       mean_by_chance = c(mean(mc$null), mean(ex$null)),
+       p_value = c(mc$p, ex$p)) |> knitr::kable(digits = 3)
+```
+
+The exact p-value is `r round(ex$p, 3)`, the same conclusion as the report's `r round(mc$p, 3)`: 2 shared edges is about what random labels give. The exact test is used for every comparison below.
+
+# Is sharing only 2 edges unusual?
+
+The permutation test asks whether the two trees agree *more* than random trees. The report's question was the reverse: did the network *change*? To answer that, we need to know how much two trees from the *same* regime normally agree when one is built from only 41 days. The report built one such tree (the last 41 days before the hike), which shared 5 of 6 edges with the full before tree. Here every contiguous 41-day block of the before window is used.
+
+For each block, two comparisons are made: the block's tree against the tree of the *rest* of the before window (two disjoint samples, the same setup as after vs before), and against the tree of the *whole* before window (the report's in-sample comparison).
+
+```{r block-null}
+bn <- block_null(w$before, NODES, block_len = 41)
+liquid_start <- as.Date("2026-04-01")   # from April 2026 at most a third of before-window days are unchanged
+bn_liquid <- dplyr::filter(bn, start >= liquid_start)
+obs_shared <- n_shared(tb, ta)
+tibble(null = c("all 41-day blocks, block vs rest", "liquid blocks (from 2026-04), block vs rest",
+                "all 41-day blocks, block vs whole window (report's check)"),
+       blocks = c(nrow(bn), nrow(bn_liquid), nrow(bn)),
+       mean_shared = c(mean(bn$shared_rest), mean(bn_liquid$shared_rest), mean(bn$shared_full)),
+       share_with_2_or_fewer = c(mean(bn$shared_rest <= obs_shared), mean(bn_liquid$shared_rest <= obs_shared),
+                                 mean(bn$shared_full <= obs_shared)),
+       share_with_5_or_more = c(mean(bn$shared_rest >= 5), mean(bn_liquid$shared_rest >= 5), mean(bn$shared_full >= 5))) |>
+  knitr::kable(digits = 2)
+```
+
+```{r block-null-fig, fig.height = 4.5}
+dplyr::bind_rows(
+  dplyr::transmute(bn, comparison = "Block vs rest of before window", shared = shared_rest),
+  dplyr::transmute(bn, comparison = "Block vs whole before window (report's check)", shared = shared_full)
+) |>
+  ggplot(aes(x = shared)) +
+  geom_bar(fill = "grey65") +
+  geom_vline(xintercept = obs_shared, colour = "firebrick", linewidth = 1) +
+  facet_wrap(~ comparison) +
+  scale_x_continuous(breaks = 0:6) +
+  labs(title = "Shared edges between a 41-day tree and a before-window tree, same regime",
+       subtitle = sprintf("Every contiguous 41-day block of 2025-10-07 to 2026-09-15 (%d blocks); red line = after vs before (%d edges)",
+                          nrow(bn), obs_shared),
+       x = "Edges shared (of 6)", y = "Number of 41-day blocks")
+```
+
+**What to notice.** Two samples from the *same* before period usually share only 1 or 2 edges: `r scales::percent(mean(bn$shared_rest <= obs_shared))` of blocks share `r obs_shared` or fewer with the rest of the window, and `r scales::percent(mean(bn_liquid$shared_rest <= obs_shared))` do in the liquid period alone. The after tree's 2 shared edges are therefore exactly what no change at all would produce. The report's 41-day check (5 of 6) was the exception: only `r sum(bn$shared_full >= 5)` of `r nrow(bn)` blocks reach 5 even in the easier in-sample comparison. **Why it matters:** with 7 nodes and 41 days, a tree is too noisy for its shape to show a change in regime. The report's conclusion that "the old structure did not carry over" does not survive this check.
+
+# Did the links get stronger?
+
+The report noted that correlations roughly doubled after the hike (mean |rho| `r round(mean_abs_rho(Cb), 2)` before, `r round(mean_abs_rho(Ca), 2)` after). The same block null shows whether a 41-day window with mean |rho| `r round(mean_abs_rho(Ca), 2)` is unusual for the before regime. The Mantel correlation (agreement between two distance matrices) is checked the same way.
+
+```{r strength}
+mantel_after <- mantel_exact(to_distance(Cb), to_distance(Ca))
+tibble(statistic = c("mean |rho|", "Mantel r with the before matrix"),
+       after_window = c(mean_abs_rho(Ca), mantel_after$r),
+       before_blocks_median = c(median(bn$mean_abs_rho), median(bn$mantel_r, na.rm = TRUE)),
+       share_of_blocks_as_extreme = c(mean(bn$mean_abs_rho >= mean_abs_rho(Ca)),
+                                      mean(bn$mantel_r <= mantel_after$r, na.rm = TRUE)),
+       share_of_liquid_blocks_as_extreme = c(mean(bn_liquid$mean_abs_rho >= mean_abs_rho(Ca)),
+                                             mean(bn_liquid$mantel_r <= mantel_after$r, na.rm = TRUE))) |>
+  knitr::kable(digits = 2)
+```
+
+An after window with links this strong is ordinary: `r scales::percent(mean(bn$mean_abs_rho >= mean_abs_rho(Ca)))` of 41-day blocks before the hike have links at least as strong. The full before window averages lower because it mixes months of stale quotes with months of active trading.
+
+```{r staleness, fig.height = 4.2}
+stale <- main$changes |>
+  tidyr::pivot_longer(dplyr::all_of(NODES), names_to = "meeting", values_to = "change") |>
+  dplyr::filter(!is.na(change)) |>
+  dplyr::mutate(month = lubridate::floor_date(date, "month")) |>
+  dplyr::group_by(month) |>
+  dplyr::summarise(zero_share = mean(change == 0), .groups = "drop")
+ggplot(stale, aes(x = month, y = zero_share)) +
+  geom_col(fill = "steelblue") +
+  geom_vline(xintercept = HIKE_DATE, linetype = "dashed", colour = "firebrick") +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  scale_x_date(date_breaks = "2 months", date_labels = "%b %y") +
+  labs(title = "Share of meeting-days with no change in expected move, by month",
+       subtitle = "7 network meetings; red dashed line is the 2026-09-16 hike",
+       x = "Month", y = "Days with zero change (%)")
+```
+
+**What to notice.** Stale quoting fades steadily through 2026 and is already near its after-hike level in August and September, *before* the hike. The drop in unchanged days that the report linked to the hike is a trend in Kalshi liquidity that started months earlier.
+
+**A test that does not work here.** The Jennrich (1970) chi-square test of equal correlation matrices gives p = `r sprintf("%.1e", jennrich_test(Cb, min(pair_counts(w$before, NODES)), Ca, min(pair_counts(w$after, NODES)))$p)` for before vs after. But it assumes independent, normally distributed days, and daily changes here are heavy-tailed, mostly zero early on, and drift over time. Applied to 41-day blocks against the rest of the before window, it rejects almost always:
+
+```{r jennrich-calibration}
+jp <- sapply(seq(1, nrow(w$before) - 40, by = 5), function(s) {
+  idx <- s:(s + 40)
+  C1 <- cor_matrix(w$before[idx, ], NODES); C2 <- cor_matrix(w$before[-idx, ], NODES)
+  if (anyNA(C1)) return(NA_real_)
+  jennrich_test(C1, 41, C2, nrow(w$before) - 41)$p
+})
+c(blocks_tested = sum(!is.na(jp)), share_rejected_at_0.05 = mean(jp < 0.05, na.rm = TRUE))
+```
+
+A test that rejects "same matrix" for two halves of the same period carries no information, so its before-vs-after p-value is not evidence of a change. The block null above is the calibrated comparison.
+
+# Edge stability
+
+How sure are we of each tree's edges? A moving-block bootstrap (blocks of 5 days, to keep short-run dependence) resamples each window 1,000 times and rebuilds the tree.
+
+```{r bootstrap}
+bs <- dplyr::bind_rows(
+  dplyr::mutate(block_bootstrap_edges(w$before, NODES, n_boot = 1000, block_len = 5), window = "Before hike"),
+  dplyr::mutate(block_bootstrap_edges(w$after,  NODES, n_boot = 1000, block_len = 5), window = "After hike")
+) |>
+  dplyr::mutate(in_tree = ifelse(window == "Before hike", edge %in% edge_keys(tb), edge %in% edge_keys(ta)),
+                window = factor(window, levels = c("Before hike", "After hike")))
+```
+
+```{r bootstrap-fig, fig.height = 6}
+bs |>
+  dplyr::group_by(window) |> dplyr::slice_max(freq, n = 10) |> dplyr::ungroup() |>
+  ggplot(aes(x = freq, y = reorder(interaction(edge, window, sep = "~"), freq), fill = in_tree)) +
+  geom_col() +
+  facet_wrap(~ window, scales = "free_y") +
+  scale_y_discrete(labels = function(x) sub("~.*", "", x)) +   # sort bars within each panel, show only the edge
+  scale_fill_manual(values = c(`TRUE` = "steelblue", `FALSE` = "grey70"),
+                    labels = c(`TRUE` = "in the window's MST", `FALSE` = "not in the MST")) +
+  scale_x_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(title = "How often each edge appears in bootstrap trees",
+       subtitle = "1,000 moving-block bootstrap samples per window (5-day blocks); top 10 edges per window",
+       x = "Share of bootstrap trees containing the edge", y = NULL, fill = NULL) +
+  theme(legend.position = "bottom")
+```
+
+**What to notice.** Only one edge per window is in at least 80% of bootstrap trees: `r paste(dplyr::filter(bs, window == "Before hike", freq >= 0.8)$edge, collapse = ", ")` before the hike and `r paste(dplyr::filter(bs, window == "After hike", freq >= 0.8)$edge, collapse = ", ")` after it. The other tree edges appear in `r scales::percent(min(bs$freq[bs$in_tree]))` to `r scales::percent(sort(bs$freq[bs$in_tree], decreasing = TRUE)[3])` of resamples, so any single tree is one draw from a wide range of plausible trees. This is consistent with the block-null result.
+
+# Rolling-window trees
+
+A tree on a 60-day rolling window shows how the network moves over time instead of in two blocks.
+
+```{r rolling}
+rt <- rolling_trees(main$changes |> dplyr::filter(!is.na(window)), NODES, width = 60,
+                    ref_trees = list(before = tb, after = ta))
+```
+
+```{r rolling-fig, fig.height = 6}
+rt |>
+  tidyr::pivot_longer(c(mean_abs_rho, shared_before, shared_after), names_to = "series", values_to = "value") |>
+  dplyr::mutate(series = factor(series, levels = c("mean_abs_rho", "shared_before", "shared_after"),
+                                labels = c("Mean |rho| over 21 pairs", "Edges shared with full before tree",
+                                           "Edges shared with after tree"))) |>
+  ggplot(aes(x = end_date, y = value)) +
+  geom_line(colour = "steelblue") +
+  geom_vline(xintercept = HIKE_DATE, linetype = "dashed", colour = "firebrick") +
+  facet_wrap(~ series, ncol = 1, scales = "free_y") +
+  scale_x_date(date_breaks = "2 months", date_labels = "%b %y") +
+  labs(title = "Minimum spanning trees on a 60-day rolling window",
+       subtitle = "Each point uses the 60 daily changes ending on that date; red dashed line is the hike",
+       x = "Window end date", y = NULL)
+```
+
+**What to notice.** Mean |rho| is highest in late 2025, when most quotes were frozen and the few days with any change moved several meetings at once (simultaneous quote refreshes). From February 2026 it moves between about 0.13 and 0.5 with no trend, and it is near its lowest around the hike, not higher. Agreement with the full before tree swings between 0 and 5 edges inside the before window itself; the windows ending in August 2026 reach 5, which is where the report's 41-day check landed. Agreement with the after tree climbs to 6 at the end only because those windows contain the after days. Nothing at the hike date stands out from the variation earlier in the year.
+
+# Robustness of the before and after trees
+
+Each variant changes one choice and rebuilds both trees. "Same as main" counts edges in common with the main trees.
+
+```{r robustness}
+variant <- function(label, b = main, method = "pearson", both_moved = FALSE) {
+  ww <- split_windows(b)
+  C1 <- cor_matrix(ww$before, NODES, method, both_moved); C2 <- cor_matrix(ww$after, NODES, method, both_moved)
+  t1 <- build_mst(C1); t2 <- build_mst(C2)
+  tibble(variant = label, shared_before_after = n_shared(t1, t2), exact_p = perm_shared_exact(t1, t2, NODES)$p,
+         mean_abs_rho_before = mean_abs_rho(C1), mean_abs_rho_after = mean_abs_rho(C2),
+         before_same_as_main = n_shared(t1, tb), after_same_as_main = n_shared(t2, ta))
+}
+m75 <- c(CUT50P = -75, CUT25 = -25, HOLD = 0, HIKE25 = 25, HIKE50P = 75)
+rob <- dplyr::bind_rows(
+  variant("main (Pearson, fixed dates)"),
+  variant("report date rule", report),
+  variant("Spearman correlation", method = "spearman"),
+  variant("Pearson, only days both meetings moved", both_moved = TRUE),
+  variant("Spearman, only days both meetings moved", method = "spearman", both_moved = TRUE),
+  variant("'more than 25 bp' legs coded +/-75 bp", build_panel(raw, move_bp = m75)),
+  variant("spread filter 10 cents", build_panel(raw, max_spread = 0.10)),
+  variant("spread filter 30 cents", build_panel(raw, max_spread = 0.30)),
+  variant("forward-fill at most 2 days", build_panel(raw, max_stale = 2)),
+  variant("forward-fill at most 10 days", build_panel(raw, max_stale = 10))
+)
+knitr::kable(rob, digits = 2, col.names = c("Variant", "Shared (of 6)", "Exact p", "Mean |rho| before",
+                                              "Mean |rho| after", "Before tree same as main", "After tree same as main"))
+```
+
+**What to notice.** No variant finds more before-after agreement than chance would give (every exact p-value is `r round(min(rob$exact_p), 2)` or higher), so the "trees share little" result is stable, but by the block-null result above it is also what no change would produce. Dropping zero-change days leaves both Pearson trees exactly as they were. Every other choice moves edges: the spread filter, the forward-fill limit, the correlation measure and the coding of the "more than 25 bp" legs each change 1 to 4 of the 6 edges in at least one tree. The tree shapes depend on cleaning choices about as much as on the data, which is another reason not to read much into a difference between two single trees. Mean |rho| roughly doubles from before to after in every variant; the block null shows that this comes from the long before window being diluted by stale months.
+
+# What changes in the conclusions
+
+- **Question 1 (which meetings are linked) stands, with a caveat.** Before the hike, the tree is a chain that mostly links meetings close in time, and its most stable edge (`r paste(dplyr::filter(bs, window == "Before hike", freq >= 0.8)$edge, collapse = ", ")`) appears in over 80% of bootstrap trees. The rest of the chain is uncertain.
+- **Question 2 (did the network change after the hike) has no detectable answer with this data.** A 41-day window after the hike looks like a typical 41-day window from before it, in tree shape, link strength, and Mantel agreement. The report's "yes" relied on comparing a short window with a long, partly stale one and on a single 41-day check that turned out to be unusual.
+- **The visible change over 2026 is market maturation.** Stale quoting in far Kalshi meetings fell from about 90% of days in late 2025 to about 5% by September 2026, before the hike. Correlation-based networks on prediction markets should be checked against liquidity trends before reading them as belief changes.
+- **The method needs more data than 41 days or 7 nodes to detect a change in shape.** A future version could wait for more post-hike data, use many more meetings or venues (adding futures would also add liquidity), or compare correlation matrices directly with a calibrated test rather than comparing trees.
+
+What is still not done: the Fed funds futures comparison. Turning futures into per-meeting moves needs daily prices for contracts that have now expired (October 2025 to October 2026), which Yahoo no longer serves and Barchart provides only as manual one-per-day downloads.
+
+# Reproducibility
+
+Raw data: `R/pull_kalshi.R` (defaults reproduce the 2026-10-29 pull). Functions: `R/wrangle.R`, `R/graph.R`. Tests: `tests/testthat/` (unit tests on synthetic inputs, plus a regression test that the functions reproduce the submitted report's numbers). Everything runs with `Rscript run_all.R` from `track2_pipeline/`.
+
+# References
+
+- Jennrich, R. I. (1970). An asymptotic chi-square test for the equality of two correlation matrices. *Journal of the American Statistical Association*, 65(330), 904-912.
+- Kunsch, H. R. (1989). The jackknife and the bootstrap for general stationary observations. *The Annals of Statistics*, 17(3), 1217-1241.
+- Mantel, N. (1967). The detection of disease clustering and a generalized regression approach. *Cancer Research*, 27(2), 209-220.
+- Mantegna, R. N. (1999). Hierarchical structure in financial markets. *The European Physical Journal B*, 11(1), 193-197.
+
+```{r session-info}
+sessionInfo()
+```
